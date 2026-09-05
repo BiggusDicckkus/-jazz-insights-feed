@@ -2,14 +2,20 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import format_datetime
 from html import unescape
 from urllib.parse import urlsplit, urlunsplit
+from xml.etree import ElementTree as ET
 
 
 PLAYLIST_RE = re.compile(
     r"playlist\s*:\s*(\[.*?\])\s*,\s*playlistId",
     re.DOTALL,
 )
+FEED_URL = "https://raw.githubusercontent.com/BiggusDicckkus/-jazz-insights-feed/main/feed.xml"
+SITE_URL = "https://jazzinsightsinfo.com/"
+ATOM_NS = "http://www.w3.org/2005/Atom"
+ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
 
 
 @dataclass(frozen=True)
@@ -108,3 +114,57 @@ def posts_to_episodes(posts: list[dict[str, object]]) -> list[Episode]:
     if not episodes:
         raise ValueError("no valid audio entries found")
     return episodes
+
+
+def format_duration(seconds: int | None) -> str | None:
+    if seconds is None or seconds <= 0:
+        return None
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def render_feed(episodes: list[Episode], feed_url: str = FEED_URL) -> bytes:
+    ET.register_namespace("atom", ATOM_NS)
+    ET.register_namespace("itunes", ITUNES_NS)
+    root = ET.Element("rss", {"version": "2.0"})
+    channel = ET.SubElement(root, "channel")
+    ET.SubElement(channel, "title").text = "Jazz Insights"
+    ET.SubElement(channel, "link").text = SITE_URL
+    ET.SubElement(channel, "description").text = (
+        "Jazz Insights podcast episodes from jazzinsightsinfo.com."
+    )
+    ET.SubElement(channel, "language").text = "en-us"
+    ET.SubElement(channel, f"{{{ATOM_NS}}}link", {
+        "href": feed_url,
+        "rel": "self",
+        "type": "application/rss+xml",
+    })
+    ET.SubElement(channel, f"{{{ITUNES_NS}}}author").text = "Jazz Insights"
+    ET.SubElement(channel, f"{{{ITUNES_NS}}}summary").text = "Jazz Insights podcast episodes."
+    ET.SubElement(channel, f"{{{ITUNES_NS}}}explicit").text = "no"
+    category = ET.SubElement(channel, f"{{{ITUNES_NS}}}category", {"text": "Music"})
+    ET.SubElement(category, f"{{{ITUNES_NS}}}category", {"text": "Jazz"})
+    if episodes:
+        latest_modified = max(episode.modified for episode in episodes)
+        ET.SubElement(channel, "lastBuildDate").text = format_datetime(
+            latest_modified,
+            usegmt=True,
+        )
+    for episode in episodes:
+        item = ET.SubElement(channel, "item")
+        ET.SubElement(item, "title").text = episode.title
+        ET.SubElement(item, "description").text = f"{episode.show_title}: {episode.title}"
+        ET.SubElement(item, "link").text = episode.page_url
+        ET.SubElement(item, "guid", {"isPermaLink": "false"}).text = episode.audio_url
+        ET.SubElement(item, "pubDate").text = format_datetime(episode.published, usegmt=True)
+        ET.SubElement(item, "enclosure", {
+            "url": episode.audio_url,
+            "length": str(episode.content_length),
+            "type": "audio/mpeg",
+        })
+        ET.SubElement(item, f"{{{ITUNES_NS}}}author").text = episode.artist or "Jazz Insights"
+        duration = format_duration(episode.duration_seconds)
+        if duration:
+            ET.SubElement(item, f"{{{ITUNES_NS}}}duration").text = duration
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
