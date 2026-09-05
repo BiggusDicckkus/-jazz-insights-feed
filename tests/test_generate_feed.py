@@ -1,4 +1,5 @@
 import json
+import ssl
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -8,6 +9,7 @@ from xml.etree import ElementTree as ET
 
 from generate_feed import (
     Episode,
+    _request,
     extract_playlist,
     format_duration,
     generate_feed,
@@ -28,6 +30,17 @@ PLAYER_HTML = '''
 </script>
 '''
 
+FAP_HTML = '''
+<div class="fap-in-page-playlist-list fap-clearfix" data-playlist="231">
+  <div class="fap-list-item fap-clearfix">
+    <div class="fap-track-content">
+      <h3>Duke Ellington's Nutcracker Suite &ndash; Episode 1</h3>
+      <a href="aHR0cHM6Ly9qYXp6aW5zaWdodHNpbmZvLmNvbS93cC1jb250ZW50L3VwbG9hZHMvMjAxNS8xMS9KYXp6X0luc2lnaHRzLUR1a2VfRWxsaW5ndG9uc19OdXRjcmFja2VyX1N1aXRlX1BhcnRfMS5tcDM=" class="fap-play-button fap-single-track">Play</a>
+    </div>
+  </div>
+</div>
+'''
+
 
 class GenerateFeedTests(unittest.TestCase):
     def test_extract_playlist_reads_embedded_player_json(self):
@@ -37,6 +50,15 @@ class GenerateFeedTests(unittest.TestCase):
         self.assertEqual(
             playlist[0]["audio"],
             "https://jazzinsightsinfo.com/wp-content/uploads/roach-1.mp3",
+        )
+
+    def test_extract_playlist_reads_encoded_fap_links(self):
+        playlist = extract_playlist(FAP_HTML)
+
+        self.assertEqual(playlist[0]["title"], "Duke Ellington's Nutcracker Suite – Episode 1")
+        self.assertEqual(
+            playlist[0]["audio"],
+            "https://jazzinsightsinfo.com/wp-content/uploads/2015/11/Jazz_Insights-Duke_Ellingtons_Nutcracker_Suite_Part_1.mp3",
         )
 
     def test_posts_to_episodes_orders_shows_deduplicates_audio_and_preserves_episode_order(self):
@@ -74,6 +96,46 @@ class GenerateFeedTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             posts_to_episodes(posts)
+
+    def test_posts_to_episodes_uses_playable_http_source_media_url(self):
+        post = {
+            "link": "https://jazzinsightsinfo.com/max-roach/",
+            "date_gmt": "2015-01-01T00:00:00",
+            "modified_gmt": "2015-01-02T00:00:00",
+            "title": {"rendered": "Max Roach"},
+            "content": {"rendered": PLAYER_HTML},
+        }
+
+        episodes = posts_to_episodes([post])
+
+        self.assertEqual(
+            episodes[0].audio_url,
+            "http://jazzinsightsinfo.com/wp-content/uploads/roach-1.mp3",
+        )
+
+    def test_request_disables_tls_verification_only_for_source_host(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch("generate_feed.urlopen", return_value=FakeResponse()) as opener:
+            with _request("https://jazzinsightsinfo.com/wp-json/"):
+                pass
+            source_context = opener.call_args.kwargs["context"]
+
+        self.assertFalse(source_context.check_hostname)
+        self.assertEqual(source_context.verify_mode, ssl.CERT_NONE)
+
+        with patch("generate_feed.urlopen", return_value=FakeResponse()) as opener:
+            with _request("https://api.example.test/posts"):
+                pass
+            other_context = opener.call_args.kwargs["context"]
+
+        self.assertTrue(other_context.check_hostname)
+        self.assertEqual(other_context.verify_mode, ssl.CERT_REQUIRED)
 
     def test_format_duration_uses_hh_mm_ss(self):
         self.assertEqual(format_duration(21962), "06:06:02")
@@ -157,8 +219,8 @@ class GenerateFeedTests(unittest.TestCase):
         ]
         requests = []
 
-        def fake_urlopen(request, timeout):
-            requests.append((request, timeout))
+        def fake_urlopen(request, timeout, context):
+            requests.append((request, timeout, context))
             return responses.pop(0)
 
         with patch("generate_feed.urlopen", side_effect=fake_urlopen):
@@ -175,6 +237,58 @@ class GenerateFeedTests(unittest.TestCase):
         self.assertEqual(requests[0][1], 30)
         self.assertEqual(requests[1][0].full_url, audio_url)
         self.assertEqual(requests[1][0].method, "HEAD")
+
+    def test_generate_feed_fetches_post_page_when_api_content_has_no_player(self):
+        class FakeResponse:
+            def __init__(self, body=b"", headers=None, status=200):
+                self.body = body
+                self.headers = headers or {}
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.body
+
+        api_url = "https://api.example.test/posts"
+        page_url = "https://jazzinsightsinfo.com/show/"
+        audio_url = "http://audio.example.test/audio.mp3"
+        body = json.dumps([{
+            "link": page_url,
+            "date_gmt": "2015-01-01T00:00:00",
+            "modified_gmt": "2015-01-02T00:00:00",
+            "title": {"rendered": "Show"},
+            "content": {"rendered": "<p>Player placeholder</p>"},
+        }]).encode()
+        page_body = PLAYER_HTML.replace(
+            "https://jazzinsightsinfo.com/wp-content/uploads/roach-1.mp3",
+            audio_url,
+        ).encode()
+        responses = [
+            FakeResponse(body, {"Content-Type": "application/json"}),
+            FakeResponse(page_body, {"Content-Type": "text/html"}),
+            FakeResponse(headers={"Content-Type": "audio/mpeg", "Content-Length": "123"}),
+        ]
+        requests = []
+
+        def fake_urlopen(request, timeout, context):
+            requests.append((request, timeout, context))
+            return responses.pop(0)
+
+        with patch("generate_feed.urlopen", side_effect=fake_urlopen):
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "feed.xml"
+                episodes = generate_feed(api_url, output)
+                rendered = output.read_bytes()
+
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual(requests[1][0].full_url, page_url)
+        self.assertEqual(requests[1][0].method, "GET")
+        self.assertIn(b'length="123"', rendered)
 
 
 if __name__ == "__main__":

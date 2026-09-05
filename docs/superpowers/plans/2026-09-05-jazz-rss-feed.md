@@ -816,3 +816,13 @@ Expected: HTTP 200, valid XML, RSS version 2.0, and all generated items have val
 Run: `git status --short --branch` and `git log --oneline -5`.
 
 Expected: `main` is clean and includes the implementation commit(s); report the exact commit IDs, episode count, workflow run result, and public feed URL.
+
+## Plan amendment from live source inspection
+
+The live WordPress API exposed 71 post URLs but only one post's rendered API
+content contained player markup. The implementation therefore fetches each
+discovered post page when its API content has no playlist, then supports both
+the older inline JSON player and the newer base64-encoded `fap` player links.
+The execution sandbox also forbids localhost socket binding, so the HTTP
+integration test uses a fake `urlopen` boundary while preserving request and
+response assertions.

@@ -18,9 +18,10 @@ published show pages through:
 `https://jazzinsightsinfo.com/wp-json/wp/v2/posts?per_page=100`
 
 The live API currently reports 71 posts. Each post includes the page link,
-publication dates, title, and rendered HTML content. Pages with audio contain a
-JavaScript configuration for the site's HTML5 playlist player, with a JSON
-array like:
+publication dates, title, and rendered HTML content. The API content is not
+complete: most current posts contain only the player placeholder, while the
+individual post page includes the server-rendered player configuration. Older
+pages contain a JavaScript configuration with a JSON array like:
 
 ```javascript
 playlist: [{"artist":"Max Roach","title":"Episode 1",
@@ -29,7 +30,14 @@ playlist: [{"artist":"Max Roach","title":"Episode 1",
 
 The media URLs are direct MP3 files hosted by the source site. The `/shows/`
 page also lists show links, but it uses client-side infinite loading; the REST
-API is the smaller and more reliable discovery surface.
+API is the smaller and more reliable discovery surface. It remains the sole
+source of show URLs; the individual URLs are fetched only to read their player
+markup when the API representation has no playlist.
+
+The source site currently presents an expired HTTPS certificate. Requests that
+reach the exact source host use a narrowly scoped certificate-verification
+fallback, while the generated MP3 enclosures use the source's direct HTTP
+media URLs, which return `200 audio/mpeg` responses without redirecting.
 
 ## Recommended approach
 
@@ -37,7 +45,11 @@ Use a dependency-free Python implementation based on the standard library:
 
 1. Fetch the WordPress REST collection with `per_page=100` and request only
    the fields needed by the feed.
-2. Extract each post's `playlist: [...]` JSON from its rendered content.
+2. Extract a `playlist: [...]` JSON array from the API content when present. If
+   it is absent, fetch the post's `link` and parse either the JSON player or the
+   newer `fap-in-page-playlist-list` markup. In the latter format, decode each
+   base64 anchor `href` into the direct MP3 URL and use the track heading as the
+   episode title.
 3. Convert each playlist entry into one RSS item. Use the source post title and
    URL as the episode context, the playlist's artist/title as the item title,
    and the post's UTC publication date as `pubDate`.
@@ -61,8 +73,8 @@ response and an audio content type.
 
 ## Components and responsibilities
 
-- `generate_feed.py` — fetching, playlist extraction, feed model creation, and
-  deterministic RSS serialization.
+- `generate_feed.py` — API/page fetching, both playlist extraction formats,
+  feed model creation, and deterministic RSS serialization.
 - `validate_feed.py` — RSS 2.0 structure checks and live enclosure checks for
   the generated artifact.
 - `tests/test_feed_generator.py` — fixture-driven parser and serializer tests,
@@ -78,7 +90,10 @@ response and an audio content type.
 WordPress REST API
         |
         v
-posts + rendered playlist JSON
+post metadata + show URLs
+        |
+        v
+post page HTML when API content lacks a playlist
         |
         v
 normalized unique episode records
@@ -95,6 +110,8 @@ The feed URL is fixed as:
 
 - HTTP errors, invalid JSON, or an empty result fail the generator with a
   non-zero exit status.
+- A failure fetching a discovered post page fails the generator rather than
+  silently dropping a show's episodes.
 - Posts without a valid playlist are skipped; a run fails if no valid audio
   entries remain.
 - Duplicate audio URLs are emitted once.
@@ -126,5 +143,7 @@ Before delivery, the implementation will be verified by:
 
 The first version will not introduce a database, persistent crawl state,
 third-party scraping framework, audio downloads, or a custom web host. The
-checked-in XML is the published artifact and the source site's WordPress API
-is the sole discovery mechanism.
+checked-in XML is the published artifact. The source site's WordPress API is
+the sole discovery mechanism for show URLs; discovered post pages are read
+only for their embedded player metadata. Certificate verification is never
+disabled for hosts other than `jazzinsightsinfo.com`.

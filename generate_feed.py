@@ -1,6 +1,9 @@
 import argparse
+import base64
+import binascii
 import json
 import re
+import ssl
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.utils import format_datetime
@@ -16,6 +19,12 @@ PLAYLIST_RE = re.compile(
     r"playlist\s*:\s*(\[.*?\])\s*,\s*playlistId",
     re.DOTALL,
 )
+FAP_TRACK_RE = re.compile(
+    r'<h3\b[^>]*>(?P<title>.*?)</h3>.*?'
+    r'<a\b(?=[^>]*\bclass\s*=\s*["\'][^"\']*fap-single-track[^"\']*["\'])'
+    r'(?=[^>]*\bhref\s*=\s*["\'](?P<audio>[^"\']+)["\'])[^>]*>',
+    re.IGNORECASE | re.DOTALL,
+)
 FEED_URL = "https://raw.githubusercontent.com/BiggusDicckkus/-jazz-insights-feed/main/feed.xml"
 SITE_URL = "https://jazzinsightsinfo.com/"
 ATOM_NS = "http://www.w3.org/2005/Atom"
@@ -25,6 +34,7 @@ API_URL = (
     "_fields=link,date,date_gmt,modified,modified_gmt,title,content"
 )
 USER_AGENT = "jazz-insights-feed/1.0"
+SOURCE_HOST = "jazzinsightsinfo.com"
 
 
 @dataclass(frozen=True)
@@ -41,16 +51,24 @@ class Episode:
 
 
 def extract_playlist(content_html: str) -> list[dict[str, object]]:
-    match = PLAYLIST_RE.search(unescape(content_html))
-    if not match:
-        return []
-    try:
-        playlist = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(playlist, list):
-        return []
-    return [entry for entry in playlist if isinstance(entry, dict)]
+    html = unescape(content_html)
+    match = PLAYLIST_RE.search(html)
+    if match:
+        try:
+            playlist = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            playlist = []
+        if isinstance(playlist, list):
+            return [entry for entry in playlist if isinstance(entry, dict)]
+
+    playlist = []
+    for match in FAP_TRACK_RE.finditer(html):
+        try:
+            audio_url = base64.b64decode(match.group("audio"), validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            continue
+        playlist.append({"title": match.group("title").strip(), "audio": audio_url})
+    return playlist
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -79,7 +97,10 @@ def _canonical_audio_url(value: str) -> str:
         hostname = f"{hostname}:{parts.port}"
     netloc = f"{parts.username}:{parts.password}@" if parts.username or parts.password else ""
     netloc += hostname
-    return urlunsplit((parts.scheme.lower(), netloc, parts.path, parts.query, ""))
+    scheme = parts.scheme.lower()
+    if hostname == SOURCE_HOST and parts.path.startswith("/wp-content/uploads/"):
+        scheme = "http"
+    return urlunsplit((scheme, netloc, parts.path, parts.query, ""))
 
 
 def posts_to_episodes(posts: list[dict[str, object]]) -> list[Episode]:
@@ -181,7 +202,11 @@ def render_feed(episodes: list[Episode], feed_url: str = FEED_URL) -> bytes:
 
 def _request(url: str, method: str = "GET"):
     request = Request(url, method=method, headers={"User-Agent": USER_AGENT})
-    return urlopen(request, timeout=30)
+    context = ssl.create_default_context()
+    if (urlsplit(url).hostname or "").lower() == SOURCE_HOST:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return urlopen(request, timeout=30, context=context)
 
 
 def fetch_posts(api_url: str = API_URL) -> list[dict[str, object]]:
@@ -193,6 +218,29 @@ def fetch_posts(api_url: str = API_URL) -> list[dict[str, object]]:
     if not isinstance(payload, list):
         raise RuntimeError("WordPress API response is not a list")
     return payload
+
+
+def fetch_page(page_url: str) -> str:
+    try:
+        with _request(page_url) as response:
+            return response.read().decode("utf-8")
+    except (HTTPError, URLError, TimeoutError, OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"unable to fetch show page {page_url}: {exc}") from exc
+
+
+def _posts_with_player_content(posts: list[dict[str, object]]) -> list[dict[str, object]]:
+    enriched: list[dict[str, object]] = []
+    for post in posts:
+        content_data = post.get("content") or {}
+        content = content_data.get("rendered") if isinstance(content_data, dict) else ""
+        if extract_playlist(_text(content)):
+            enriched.append(post)
+            continue
+        page_url = _text(post.get("link"))
+        if not page_url:
+            raise RuntimeError("WordPress post has no link")
+        enriched.append({**post, "content": {"rendered": fetch_page(page_url)}})
+    return enriched
 
 
 def fetch_content_length(audio_url: str) -> int:
@@ -208,7 +256,7 @@ def generate_feed(
     api_url: str = API_URL,
     output_path: Path = Path("feed.xml"),
 ) -> list[Episode]:
-    episodes = posts_to_episodes(fetch_posts(api_url))
+    episodes = posts_to_episodes(_posts_with_player_content(fetch_posts(api_url)))
     sized = [
         replace(episode, content_length=fetch_content_length(episode.audio_url))
         for episode in episodes
