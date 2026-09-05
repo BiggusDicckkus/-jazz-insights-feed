@@ -1,8 +1,20 @@
+import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import patch
 from xml.etree import ElementTree as ET
 
-from generate_feed import Episode, extract_playlist, format_duration, posts_to_episodes, render_feed
+from generate_feed import (
+    Episode,
+    extract_playlist,
+    format_duration,
+    generate_feed,
+    posts_to_episodes,
+    render_feed,
+    USER_AGENT,
+)
 
 
 PLAYER_HTML = '''
@@ -110,6 +122,59 @@ class GenerateFeedTests(unittest.TestCase):
 
         self.assertEqual(rendered, render_feed([episode]))
         ET.fromstring(rendered)
+
+    def test_generate_feed_fetches_api_and_head_lengths(self):
+        class FakeResponse:
+            def __init__(self, body=b"", headers=None, status=200):
+                self.body = body
+                self.headers = headers or {}
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.body
+
+        api_url = "https://api.example.test/posts"
+        audio_url = "https://audio.example.test/audio.mp3"
+        body = json.dumps([{
+            "link": "https://jazzinsightsinfo.com/show/",
+            "date_gmt": "2015-01-01T00:00:00",
+            "modified_gmt": "2015-01-02T00:00:00",
+            "title": {"rendered": "Show"},
+            "content": {"rendered": PLAYER_HTML.replace(
+                "https://jazzinsightsinfo.com/wp-content/uploads/roach-1.mp3",
+                audio_url,
+            )},
+        }]).encode()
+        responses = [
+            FakeResponse(body, {"Content-Type": "application/json"}),
+            FakeResponse(headers={"Content-Type": "audio/mpeg", "Content-Length": "123"}),
+        ]
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append((request, timeout))
+            return responses.pop(0)
+
+        with patch("generate_feed.urlopen", side_effect=fake_urlopen):
+            with tempfile.TemporaryDirectory() as directory:
+                output = Path(directory) / "feed.xml"
+                episodes = generate_feed(api_url, output)
+                rendered = output.read_bytes()
+
+        self.assertEqual(len(episodes), 1)
+        self.assertIn(b'length="123"', rendered)
+        self.assertEqual(requests[0][0].full_url, api_url)
+        self.assertEqual(requests[0][0].method, "GET")
+        self.assertEqual(requests[0][0].get_header("User-agent"), USER_AGENT)
+        self.assertEqual(requests[0][1], 30)
+        self.assertEqual(requests[1][0].full_url, audio_url)
+        self.assertEqual(requests[1][0].method, "HEAD")
 
 
 if __name__ == "__main__":

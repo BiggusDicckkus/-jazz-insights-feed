@@ -1,9 +1,13 @@
+import argparse
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from html import unescape
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree as ET
 
@@ -16,6 +20,11 @@ FEED_URL = "https://raw.githubusercontent.com/BiggusDicckkus/-jazz-insights-feed
 SITE_URL = "https://jazzinsightsinfo.com/"
 ATOM_NS = "http://www.w3.org/2005/Atom"
 ITUNES_NS = "http://www.itunes.com/dtds/podcast-1.0.dtd"
+API_URL = (
+    "https://jazzinsightsinfo.com/wp-json/wp/v2/posts?per_page=100&"
+    "_fields=link,date,date_gmt,modified,modified_gmt,title,content"
+)
+USER_AGENT = "jazz-insights-feed/1.0"
 
 
 @dataclass(frozen=True)
@@ -168,3 +177,55 @@ def render_feed(episodes: list[Episode], feed_url: str = FEED_URL) -> bytes:
         if duration:
             ET.SubElement(item, f"{{{ITUNES_NS}}}duration").text = duration
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _request(url: str, method: str = "GET"):
+    request = Request(url, method=method, headers={"User-Agent": USER_AGENT})
+    return urlopen(request, timeout=30)
+
+
+def fetch_posts(api_url: str = API_URL) -> list[dict[str, object]]:
+    try:
+        with _request(api_url) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"unable to fetch WordPress posts: {exc}") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError("WordPress API response is not a list")
+    return payload
+
+
+def fetch_content_length(audio_url: str) -> int:
+    try:
+        with _request(audio_url, method="HEAD") as response:
+            value = int(response.headers.get("Content-Length", "0"))
+            return value if value > 0 else 0
+    except (HTTPError, URLError, ValueError, TimeoutError, OSError):
+        return 0
+
+
+def generate_feed(
+    api_url: str = API_URL,
+    output_path: Path = Path("feed.xml"),
+) -> list[Episode]:
+    episodes = posts_to_episodes(fetch_posts(api_url))
+    sized = [
+        replace(episode, content_length=fetch_content_length(episode.audio_url))
+        for episode in episodes
+    ]
+    output_path.write_bytes(render_feed(sized))
+    return sized
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate the Jazz Insights RSS feed")
+    parser.add_argument("--api-url", default=API_URL)
+    parser.add_argument("--output", type=Path, default=Path("feed.xml"))
+    args = parser.parse_args()
+    episodes = generate_feed(args.api_url, args.output)
+    print(f"wrote {len(episodes)} episodes to {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
